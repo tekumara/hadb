@@ -149,6 +149,7 @@ impl FollowerBehavior for MockFollowerBehavior {
 
     async fn catchup_on_promotion(
         &self,
+        _replicator: Arc<dyn Replicator>,
         _prefix: &str,
         _db_name: &str,
         _db_path: &PathBuf,

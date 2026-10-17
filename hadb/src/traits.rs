@@ -37,6 +37,22 @@ pub trait Replicator: Send + Sync {
     /// Should download incremental updates and apply them to local DB.
     async fn pull(&self, name: &str, path: &Path) -> Result<()>;
 
+    /// Restore and return the position actually applied, before follower tasks
+    /// (including promotion monitoring) start. Implementations with a replay
+    /// cursor must override this and retain any engine-specific anchor needed
+    /// by `pull_incremental`. The default preserves legacy unpositioned pull.
+    async fn pull_with_position(&self, name: &str, path: &Path) -> Result<u64> {
+        self.pull(name, path).await?;
+        Ok(0)
+    }
+
+    /// Replay from the implementation's last successfully applied cursor.
+    /// Never infer a starting cursor from a remote head or accept an unanchored
+    /// first update. Unsupported implementations fail closed.
+    async fn pull_incremental(&self, _name: &str, _path: &Path) -> Result<u64> {
+        anyhow::bail!("cursor-aware incremental replay is not supported")
+    }
+
     /// Remove database from replication (stop syncing).
     ///
     /// Called when leaving the cluster or on shutdown. Should stop
