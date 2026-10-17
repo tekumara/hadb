@@ -64,10 +64,14 @@ pub trait FollowerBehavior: Send + Sync {
     /// - SQLite: calls `walrust::sync::pull_incremental` from the given TXID
     /// - Kuzu: calls `graphstream::pull_from` from the given checkpoint
     ///
+    /// `replicator` is the same instance used for restore and live replay. Use
+    /// it when catch-up depends on retained engine-specific verification state.
+    ///
     /// The caller wraps this in a timeout — implementations should not add their own.
     /// Return Ok(()) if no catch-up is needed (e.g. position == 0).
     async fn catchup_on_promotion(
         &self,
+        replicator: Arc<dyn Replicator>,
         prefix: &str,
         db_name: &str,
         db_path: &PathBuf,
@@ -213,6 +217,7 @@ pub async fn run_lease_monitor(mut ctx: LeaseMonitorContext) -> Result<bool> {
                                 let catchup_result = tokio::time::timeout(
                                     ctx.replicator_timeout,
                                     ctx.follower_behavior.catchup_on_promotion(
+                                        ctx.replicator.clone(),
                                         &ctx.prefix,
                                         &ctx.db_name,
                                         &ctx.db_path,

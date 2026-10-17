@@ -321,10 +321,10 @@ impl Coordinator {
                 })
             }
             Role::Follower => {
-                // Restore from storage to get a base snapshot.
-                tokio::time::timeout(
+                // Preserve the restored cursor before spawning replay/promotion.
+                let restored_position = tokio::time::timeout(
                     self.config.replicator_timeout,
-                    self.replicator.pull(name, db_path),
+                    self.replicator.pull_with_position(name, db_path),
                 )
                 .await
                 .map_err(|_| {
@@ -359,7 +359,10 @@ impl Coordinator {
 
                 // Create shared atomics here so DbEntry, run_follower_tasks, and JoinResult
                 // all share the same Arc refs.
-                let follower_position = Arc::new(AtomicU64::new(0));
+                let follower_position = Arc::new(AtomicU64::new(restored_position));
+                self.metrics
+                    .follower_replay_position
+                    .store(restored_position, Ordering::Relaxed);
                 let follower_caught_up = Arc::new(AtomicBool::new(false));
 
                 let self_clone = self.clone();
@@ -494,9 +497,9 @@ impl Coordinator {
         lease: DbLease,
         lease_config: &crate::types::LeaseConfig,
     ) -> Result<JoinResult> {
-        tokio::time::timeout(
+        let restored_position = tokio::time::timeout(
             self.config.replicator_timeout,
-            self.replicator.pull(name, db_path),
+            self.replicator.pull_with_position(name, db_path),
         )
         .await
         .map_err(|_| {
@@ -512,7 +515,10 @@ impl Coordinator {
             _ => String::new(),
         }));
         let shared_role = Arc::new(AtomicRole::new(Role::Client));
-        let client_position = Arc::new(AtomicU64::new(0));
+        let client_position = Arc::new(AtomicU64::new(restored_position));
+        self.metrics
+            .follower_replay_position
+            .store(restored_position, Ordering::Relaxed);
         let client_caught_up = Arc::new(AtomicBool::new(false));
         let (cancel_tx, cancel_rx) = watch::channel(false);
 
