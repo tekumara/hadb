@@ -99,6 +99,8 @@ impl Replicator for MockReplicator {
 struct HangingRenewLeaseStore {
     inner: InMemoryLeaseStore,
     renew_started: Arc<Notify>,
+    release_fence: Mutex<Option<hadb_lease::AtomicFence>>,
+    release_observation: Mutex<Option<bool>>,
 }
 
 impl HangingRenewLeaseStore {
@@ -106,6 +108,8 @@ impl HangingRenewLeaseStore {
         Self {
             inner: InMemoryLeaseStore::new(),
             renew_started: Arc::new(Notify::new()),
+            release_fence: Mutex::new(None),
+            release_observation: Mutex::new(None),
         }
     }
 
@@ -124,7 +128,18 @@ impl LeaseStore for HangingRenewLeaseStore {
         self.inner.write_if_not_exists(key, data).await
     }
 
-    async fn write_if_match(&self, _key: &str, _data: Vec<u8>, _etag: &str) -> Result<CasResult> {
+    async fn write_if_match(&self, _key: &str, data: Vec<u8>, _etag: &str) -> Result<CasResult> {
+        if serde_json::from_slice::<LeaseData>(&data).is_ok_and(|lease| lease.ttl_secs == 0) {
+            // Observe the public release CAS BEFORE its await can allow an
+            // aborted-but-not-yet-joined owner to finish dropping its fence.
+            let active = self
+                .release_fence
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|fence| fence.current().is_some());
+            *self.release_observation.lock().unwrap() = Some(active);
+        }
         self.renew_started.notify_waiters();
         std::future::pending::<Result<CasResult>>().await
     }
@@ -797,39 +812,68 @@ async fn test_leave_aborts_stuck_leader_renewal_task() {
 
 #[tokio::test]
 async fn test_cancelled_leave_retains_owner_join_for_retry() {
-    let store = Arc::new(HangingRenewLeaseStore::new());
-    let renew_started = store.renew_started();
-    let (fence, writer) = hadb_lease::AtomicFence::new();
-    let mut config = CoordinatorConfig::default();
-    config.fence_writer = Some(Arc::new(writer));
-    config.lease = Some(LeaseConfig::new(store, "owner".into(), "address".into()));
-    let (coordinator, _) = test_coordinator(config);
-    coordinator
-        .join("db", &PathBuf::from("unused-cancellation-contract.db"))
-        .await
-        .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), renew_started.notified())
-        .await
-        .unwrap();
-
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), coordinator.leave("db"))
+    for follower_first in [false, true] {
+        let store = Arc::new(HangingRenewLeaseStore::new());
+        let key = store.key_for("db");
+        if follower_first {
+            let mut foreign = DbLease::new(store.clone(), &key, "other", "other-address", 60);
+            assert_eq!(foreign.try_claim().await.unwrap(), Role::Leader);
+        }
+        let renew_started = store.renew_started();
+        let (fence, writer) = hadb_lease::AtomicFence::new();
+        *store.release_fence.lock().unwrap() = Some(fence.clone());
+        let mut config = CoordinatorConfig::default();
+        config.fence_writer = Some(Arc::new(writer));
+        let mut lease = LeaseConfig::new(store.clone(), "owner".into(), "address".into());
+        lease.follower_poll_interval = Duration::from_millis(10);
+        config.lease = Some(lease);
+        let (coordinator, _) = test_coordinator(config);
+        let joined = coordinator
+            .join("db", &PathBuf::from("unused-cancellation-contract.db"))
             .await
-            .is_err()
-    );
-    assert!(
-        coordinator.contains("db").await,
-        "interrupted leave retains the entry for retry"
-    );
-    tokio::time::timeout(Duration::from_secs(2), coordinator.leave("db"))
-        .await
-        .expect("retry must still join or abort the actual owner, not detach it")
-        .unwrap();
-    assert!(!coordinator.contains("db").await);
-    assert!(
-        fence.current().is_none(),
-        "completed retry must revoke the stopped owner's fence"
-    );
+            .unwrap();
+        assert_eq!(
+            joined.role,
+            if follower_first {
+                Role::Follower
+            } else {
+                Role::Leader
+            }
+        );
+        if follower_first {
+            // Remove only the fixture's foreign seed so the independently
+            // scheduled monitor can acquire and enter its stuck renewal.
+            store.inner.delete(&key).await.unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), renew_started.notified())
+            .await
+            .unwrap();
+        assert!(fence.current().is_some(), "the actual owner is renewing");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), coordinator.leave("db"))
+                .await
+                .is_err()
+        );
+        assert!(
+            coordinator.contains("db").await,
+            "interrupted leave retains the entry for retry"
+        );
+        tokio::time::timeout(Duration::from_secs(2), coordinator.leave("db"))
+            .await
+            .expect("retry must still join or abort the actual owner, not detach it")
+            .unwrap();
+        assert!(!coordinator.contains("db").await);
+        assert!(
+            fence.current().is_none(),
+            "completed retry must revoke the stopped owner's fence"
+        );
+        assert_eq!(
+            *store.release_observation.lock().unwrap(),
+            Some(false),
+            "release must observe the actual owner already stopped, not merely abort requested"
+        );
+    }
 }
 
 #[tokio::test]

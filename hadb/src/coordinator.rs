@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tokio::sync::{broadcast, watch, RwLock};
-use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 
 use crate::follower::{
     run_leader_renewal, run_lease_monitor, FollowerBehavior, LeaseMonitorContext,
@@ -56,16 +56,54 @@ pub struct JoinResult {
     pub position: Arc<AtomicU64>,
 }
 
+/// Independently scheduled tasks owned by one database. JoinSet aborts any
+/// remaining tasks on drop, but graceful cleanup explicitly joins EVERY task
+/// before releasing ownership. The set and abort state survive cancelled waits.
+#[derive(Default)]
+struct DbTasks {
+    tasks: JoinSet<()>,
+    aborted: bool,
+}
+
+impl DbTasks {
+    fn spawn(&mut self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.tasks.spawn(future);
+    }
+
+    fn abort(&mut self) {
+        self.aborted = true;
+        self.tasks.abort_all();
+    }
+
+    async fn join(&mut self, name: &str) {
+        // join_next is cancellation-safe: a dropped waiter leaves unfinished
+        // tasks in the set, so a retried leave can still join the actual owner.
+        while let Some(result) = self.tasks.join_next().await {
+            if let Err(error) = result {
+                if error.is_cancelled() {
+                    self.aborted = true;
+                } else {
+                    tracing::warn!(
+                        "Coordinator: background task for '{}' exited with join error: {}",
+                        name,
+                        error
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Per-database entry in the coordinator.
 ///
 /// The shared `caught_up` / `position` atomics that haqlite reads come back
 /// to the caller via `JoinResult` — DbEntry only needs the bookkeeping it
-/// uses internally (role, address, cancel handle, task handle).
+/// uses internally (role, address, cancellation and owned background tasks).
 struct DbEntry {
     role: Arc<AtomicRole>,
     leader_address: Arc<RwLock<String>>,
     cancel_tx: watch::Sender<bool>,
-    task_handle: Option<JoinHandle<()>>,
+    tasks: DbTasks,
     release: Option<LeaseRelease>,
 }
 
@@ -155,7 +193,7 @@ impl Coordinator {
                         role: Arc::new(AtomicRole::new(Role::Leader)),
                         leader_address: Arc::new(RwLock::new(String::new())),
                         cancel_tx,
-                        task_handle: None,
+                        tasks: DbTasks::default(),
                         release: None,
                     },
                 );
@@ -234,7 +272,8 @@ impl Coordinator {
                 let metrics = self.metrics.clone();
                 let mut renewal_cancel_rx = cancel_rx.clone();
 
-                let task_handle = tokio::spawn(async move {
+                let mut tasks = DbTasks::default();
+                tasks.spawn(async move {
                     let demoted = run_leader_renewal(
                         &mut lease,
                         &replicator,
@@ -263,7 +302,7 @@ impl Coordinator {
 
                 if let Some(ref hook) = self.config.before_leader_add {
                     if let Err(e) = hook() {
-                        self.cancel_leader_start(name, &cancel_tx, task_handle, &release)
+                        self.cancel_leader_start(name, &cancel_tx, tasks, &release)
                             .await;
                         return Err(e).context("Coordinator: before_leader_add hook failed");
                     }
@@ -285,13 +324,13 @@ impl Coordinator {
                 .and_then(|r| r);
 
                 if let Err(e) = add_result {
-                    self.cancel_leader_start(name, &cancel_tx, task_handle, &release)
+                    self.cancel_leader_start(name, &cancel_tx, tasks, &release)
                         .await;
                     return Err(e);
                 }
 
                 if shared_role.load() != Role::Leader {
-                    self.cancel_leader_start(name, &cancel_tx, task_handle, &release)
+                    self.cancel_leader_start(name, &cancel_tx, tasks, &release)
                         .await;
                     return Err(anyhow::anyhow!(
                         "Coordinator: lost leader lease while starting '{}'",
@@ -308,7 +347,7 @@ impl Coordinator {
                         role: shared_role,
                         leader_address: leader_addr,
                         cancel_tx,
-                        task_handle: Some(task_handle),
+                        tasks,
                         release: Some(release),
                     },
                 );
@@ -361,45 +400,32 @@ impl Coordinator {
 
                 let (follower_stop_tx, follower_stop_rx) = watch::channel(false);
 
-                // Create shared atomics here so DbEntry, run_follower_tasks, and JoinResult
+                // Create shared atomics here so DbEntry, follower tasks, and JoinResult
                 // all share the same Arc refs.
                 let follower_position = Arc::new(AtomicU64::new(0));
                 let follower_caught_up = Arc::new(AtomicBool::new(false));
 
-                let self_clone = self.clone();
-                let db_name = name.to_string();
-                let db_path_buf = db_path.to_path_buf();
-                let role_for_entry = shared_role.clone();
-                let addr_for_entry = leader_addr.clone();
-                let pos_for_tasks = follower_position.clone();
-                let cu_for_tasks = follower_caught_up.clone();
-
-                let lease_config_owned = lease_config.clone();
-                let task_handle = tokio::spawn(async move {
-                    self_clone
-                        .run_follower_tasks(
-                            db_name,
-                            db_path_buf,
-                            lease,
-                            lease_config_owned,
-                            shared_role,
-                            leader_addr,
-                            follower_stop_tx,
-                            follower_stop_rx,
-                            cancel_rx,
-                            pos_for_tasks,
-                            cu_for_tasks,
-                        )
-                        .await;
-                });
+                let tasks = self.spawn_follower_tasks(
+                    name.to_string(),
+                    db_path.to_path_buf(),
+                    lease,
+                    lease_config.clone(),
+                    shared_role.clone(),
+                    leader_addr.clone(),
+                    follower_stop_tx,
+                    follower_stop_rx,
+                    cancel_rx,
+                    follower_position.clone(),
+                    follower_caught_up.clone(),
+                );
 
                 self.databases.write().await.insert(
                     name.to_string(),
                     DbEntry {
-                        role: role_for_entry,
-                        leader_address: addr_for_entry,
+                        role: shared_role,
+                        leader_address: leader_addr,
                         cancel_tx,
-                        task_handle: Some(task_handle),
+                        tasks,
                         release: Some(release),
                     },
                 );
@@ -425,49 +451,30 @@ impl Coordinator {
         &self,
         name: &str,
         cancel_tx: &watch::Sender<bool>,
-        task_handle: JoinHandle<()>,
+        mut tasks: DbTasks,
         release: &LeaseRelease,
     ) {
         let _ = cancel_tx.send(true);
-        let mut task_handle = Some(task_handle);
-        let aborted = self.await_cancelled_task(name, &mut task_handle).await;
+        let aborted = self.await_cancelled_tasks(name, &mut tasks).await;
         self.release_owned(name, Some(release), aborted).await;
     }
 
-    async fn await_cancelled_task(
-        &self,
-        name: &str,
-        task_handle: &mut Option<JoinHandle<()>>,
-    ) -> bool {
-        // Leave the handle in its entry while awaiting. Cancelling this wait
-        // must not detach the owner and deprive a later close of its join.
-        let Some(handle) = task_handle.as_mut() else {
-            return false;
-        };
-        let aborted = tokio::select! {
-            result = &mut *handle => match result {
-                Ok(()) => false,
-                // A previous stop attempt may have aborted the task before
-                // its own waiter was cancelled. Retain the short release budget.
-                Err(e) if e.is_cancelled() => true,
-                Err(e) => {
-                    tracing::warn!("Coordinator: background task for '{}' exited with join error: {}", name, e);
-                    false
-                }
-            },
-            _ = tokio::time::sleep(Self::BACKGROUND_TASK_CANCEL_GRACE) => {
-                handle.abort();
-                let _ = handle.await;
-                tracing::warn!(
-                    "Coordinator: aborted background task for '{}' after {:?} cancel grace",
-                    name,
-                    Self::BACKGROUND_TASK_CANCEL_GRACE
-                );
-                true
-            }
-        };
-        task_handle.take();
-        aborted
+    async fn await_cancelled_tasks(&self, name: &str, tasks: &mut DbTasks) -> bool {
+        if tokio::time::timeout(Self::BACKGROUND_TASK_CANCEL_GRACE, tasks.join(name))
+            .await
+            .is_err()
+        {
+            tasks.abort();
+            // Aborting the set alone is not evidence of termination. In
+            // particular, the actual lease owner must be joined before release.
+            tasks.join(name).await;
+            tracing::warn!(
+                "Coordinator: aborted background tasks for '{}' after {:?} cancel grace",
+                name,
+                Self::BACKGROUND_TASK_CANCEL_GRACE
+            );
+        }
+        tasks.aborted
     }
 
     async fn release_owned(&self, name: &str, release: Option<&LeaseRelease>, owner_aborted: bool) {
@@ -531,7 +538,8 @@ impl Coordinator {
         let position = client_position.clone();
         let caught_up = client_caught_up.clone();
 
-        let task_handle = tokio::spawn(async move {
+        let mut tasks = DbTasks::default();
+        tasks.spawn(async move {
             let _ = behavior
                 .run_follower_loop(
                     replicator,
@@ -553,7 +561,7 @@ impl Coordinator {
                 role: shared_role,
                 leader_address: leader_addr,
                 cancel_tx,
-                task_handle: Some(task_handle),
+                tasks,
                 release: None,
             },
         );
@@ -574,14 +582,14 @@ impl Coordinator {
         })
     }
 
-    /// Run follower tasks (pull loop + lease monitor). The caller passes
+    /// Spawn owned follower tasks (pull loop + lease monitor). The caller passes
     /// `lease_config` in directly because this function is only ever
     /// reached on the HA path (where `self.config.lease` is already
     /// `Some`), and threading the config through avoids a redundant
     /// "panic if missing" lookup here.
     #[allow(clippy::too_many_arguments)]
-    async fn run_follower_tasks(
-        self: Arc<Self>,
+    fn spawn_follower_tasks(
+        &self,
         db_name: String,
         db_path: std::path::PathBuf,
         lease: DbLease,
@@ -593,7 +601,7 @@ impl Coordinator {
         cancel_rx: watch::Receiver<bool>,
         shared_position: Arc<AtomicU64>,
         shared_caught_up: Arc<AtomicBool>,
-    ) {
+    ) -> DbTasks {
         let ctx = LeaseMonitorContext {
             lease,
             replicator: self.replicator.clone(),
@@ -616,22 +624,33 @@ impl Coordinator {
             node_registry: self.node_registry.clone(),
             metrics: self.metrics.clone(),
         };
-        // Both futures belong to this task. Aborting it must drop the lease
-        // owner too, not detach a monitor that can keep renewing after leave.
-        let _ = tokio::join!(
-            self.follower_behavior.run_follower_loop(
-                self.replicator.clone(),
-                &self.prefix,
-                &db_name,
-                &db_path,
-                self.config.follower_pull_interval,
-                shared_position,
-                shared_caught_up,
-                follower_stop_rx,
-                self.metrics.clone(),
-            ),
-            run_lease_monitor(ctx),
-        );
+        // VFS bridges may block_in_place. Raw join! siblings would suspend
+        // each other; these actors need independent scheduling AND ownership.
+        let behavior = self.follower_behavior.clone();
+        let replicator = self.replicator.clone();
+        let prefix = self.prefix.clone();
+        let pull_interval = self.config.follower_pull_interval;
+        let metrics = self.metrics.clone();
+        let mut tasks = DbTasks::default();
+        tasks.spawn(async move {
+            let _ = behavior
+                .run_follower_loop(
+                    replicator,
+                    &prefix,
+                    &db_name,
+                    &db_path,
+                    pull_interval,
+                    shared_position,
+                    shared_caught_up,
+                    follower_stop_rx,
+                    metrics,
+                )
+                .await;
+        });
+        tasks.spawn(async move {
+            let _ = run_lease_monitor(ctx).await;
+        });
+        tasks
     }
 
     /// Simulate process-level crash for tests: abort all background tasks
@@ -656,13 +675,15 @@ impl Coordinator {
     /// consume hadb without a shared feature flag. Treat as test-only.
     pub async fn abort_tasks_for_test(&self) {
         let mut dbs = self.databases.write().await;
-        let entries: Vec<(String, DbEntry)> = dbs.drain().collect();
+        let mut entries: Vec<(String, DbEntry)> = dbs.drain().collect();
         drop(dbs);
-        for (name, entry) in entries {
-            if let Some(task) = entry.task_handle {
-                task.abort();
-                let _ = task.await;
-            }
+        // Request every abort before awaiting any task. A blocking follower
+        // in one database must not leave another database's owner renewing.
+        for (_, entry) in &mut entries {
+            entry.tasks.abort();
+        }
+        for (name, mut entry) in entries {
+            entry.tasks.join(&name).await;
             tracing::warn!(
                 "Coordinator: ABORTED tasks for '{}' (test-only crash simulation)",
                 name
@@ -689,9 +710,7 @@ impl Coordinator {
         }
 
         let _ = entry.cancel_tx.send(true);
-        let owner_aborted = self
-            .await_cancelled_task(name, &mut entry.task_handle)
-            .await;
+        let owner_aborted = self.await_cancelled_tasks(name, &mut entry.tasks).await;
         // Readiness role can still be Follower during promotion catch-up.
         // Release any acquisition this actual task confirmed, regardless of role.
         self.release_owned(name, entry.release.as_ref(), owner_aborted)
@@ -856,9 +875,7 @@ impl Coordinator {
             })??;
 
         let _ = entry.cancel_tx.send(true);
-        let owner_aborted = self
-            .await_cancelled_task(name, &mut entry.task_handle)
-            .await;
+        let owner_aborted = self.await_cancelled_tasks(name, &mut entry.tasks).await;
         self.release_owned(name, entry.release.as_ref(), owner_aborted)
             .await;
 
