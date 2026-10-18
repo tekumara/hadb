@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 use crate::follower::{
     run_leader_renewal, run_lease_monitor, FollowerBehavior, LeaseMonitorContext,
 };
-use crate::lease::DbLease;
+use crate::lease::{DbLease, LeaseRelease};
 use crate::metrics::HaMetrics;
 use crate::node_registry::{NodeRegistration, NodeRegistry};
 use crate::traits::Replicator;
@@ -65,7 +65,8 @@ struct DbEntry {
     role: Arc<AtomicRole>,
     leader_address: Arc<RwLock<String>>,
     cancel_tx: watch::Sender<bool>,
-    task_handle: JoinHandle<()>,
+    task_handle: Option<JoinHandle<()>>,
+    release: Option<LeaseRelease>,
 }
 
 /// HA coordinator.
@@ -154,7 +155,8 @@ impl Coordinator {
                         role: Arc::new(AtomicRole::new(Role::Leader)),
                         leader_address: Arc::new(RwLock::new(String::new())),
                         cancel_tx,
-                        task_handle: tokio::spawn(async {}),
+                        task_handle: None,
+                        release: None,
                     },
                 );
                 let _ = self.role_tx.send(RoleEvent::Joined {
@@ -219,6 +221,7 @@ impl Coordinator {
             }
         }));
 
+        let release = lease.release_handle();
         match role {
             Role::Leader => {
                 let replicator = self.replicator.clone();
@@ -260,7 +263,7 @@ impl Coordinator {
 
                 if let Some(ref hook) = self.config.before_leader_add {
                     if let Err(e) = hook() {
-                        self.cancel_leader_start(name, &cancel_tx, task_handle, lease_config)
+                        self.cancel_leader_start(name, &cancel_tx, task_handle, &release)
                             .await;
                         return Err(e).context("Coordinator: before_leader_add hook failed");
                     }
@@ -282,13 +285,13 @@ impl Coordinator {
                 .and_then(|r| r);
 
                 if let Err(e) = add_result {
-                    self.cancel_leader_start(name, &cancel_tx, task_handle, lease_config)
+                    self.cancel_leader_start(name, &cancel_tx, task_handle, &release)
                         .await;
                     return Err(e);
                 }
 
                 if shared_role.load() != Role::Leader {
-                    self.cancel_leader_start(name, &cancel_tx, task_handle, lease_config)
+                    self.cancel_leader_start(name, &cancel_tx, task_handle, &release)
                         .await;
                     return Err(anyhow::anyhow!(
                         "Coordinator: lost leader lease while starting '{}'",
@@ -305,7 +308,8 @@ impl Coordinator {
                         role: shared_role,
                         leader_address: leader_addr,
                         cancel_tx,
-                        task_handle,
+                        task_handle: Some(task_handle),
+                        release: Some(release),
                     },
                 );
 
@@ -395,7 +399,8 @@ impl Coordinator {
                         role: role_for_entry,
                         leader_address: addr_for_entry,
                         cancel_tx,
-                        task_handle,
+                        task_handle: Some(task_handle),
+                        release: Some(release),
                     },
                 );
 
@@ -421,69 +426,69 @@ impl Coordinator {
         name: &str,
         cancel_tx: &watch::Sender<bool>,
         task_handle: JoinHandle<()>,
-        lease_config: &crate::types::LeaseConfig,
+        release: &LeaseRelease,
     ) {
         let _ = cancel_tx.send(true);
-        self.await_cancelled_task(name, task_handle).await;
-        self.release_lease_if_owned(name, lease_config).await;
+        let mut task_handle = Some(task_handle);
+        let aborted = self.await_cancelled_task(name, &mut task_handle).await;
+        self.release_owned(name, Some(release), aborted).await;
     }
 
-    async fn await_cancelled_task(&self, name: &str, task_handle: JoinHandle<()>) {
-        let mut task_handle = task_handle;
-        tokio::select! {
-            result = &mut task_handle => match result {
-                Ok(()) => {}
-                Err(e) if e.is_cancelled() => {}
+    async fn await_cancelled_task(
+        &self,
+        name: &str,
+        task_handle: &mut Option<JoinHandle<()>>,
+    ) -> bool {
+        // Leave the handle in its entry while awaiting. Cancelling this wait
+        // must not detach the owner and deprive a later close of its join.
+        let Some(handle) = task_handle.as_mut() else {
+            return false;
+        };
+        let aborted = tokio::select! {
+            result = &mut *handle => match result {
+                Ok(()) => false,
+                // A previous stop attempt may have aborted the task before
+                // its own waiter was cancelled. Retain the short release budget.
+                Err(e) if e.is_cancelled() => true,
                 Err(e) => {
-                    tracing::warn!(
-                        "Coordinator: background task for '{}' exited with join error: {}",
-                        name,
-                        e
-                    );
+                    tracing::warn!("Coordinator: background task for '{}' exited with join error: {}", name, e);
+                    false
                 }
             },
             _ = tokio::time::sleep(Self::BACKGROUND_TASK_CANCEL_GRACE) => {
-                task_handle.abort();
-                let _ = task_handle.await;
+                handle.abort();
+                let _ = handle.await;
                 tracing::warn!(
                     "Coordinator: aborted background task for '{}' after {:?} cancel grace",
                     name,
                     Self::BACKGROUND_TASK_CANCEL_GRACE
                 );
+                true
             }
-        }
+        };
+        task_handle.take();
+        aborted
     }
 
-    async fn release_lease_if_owned(&self, name: &str, lease_config: &crate::types::LeaseConfig) {
-        let lease_key = lease_config.store.key_for(name);
-        let lease = DbLease::new(
-            lease_config.store.clone(),
-            &lease_key,
-            &lease_config.instance_id,
-            &lease_config.address,
-            lease_config.ttl_secs,
-        );
-        match lease.read().await {
-            Ok(Some((data, _))) if data.instance_id == lease_config.instance_id => {
-                if let Err(e) = lease_config.store.delete(lease.lease_key()).await {
-                    tracing::error!("Coordinator: failed to release lease for '{}': {}", name, e);
-                }
+    async fn release_owned(&self, name: &str, release: Option<&LeaseRelease>, owner_aborted: bool) {
+        let Some(release) = release else {
+            return;
+        };
+        // A stuck renewal backend may also wedge conditional release. Preserve
+        // bounded shutdown without imposing this short budget on healthy owners.
+        let budget = if owner_aborted {
+            self.config
+                .replicator_timeout
+                .min(Self::BACKGROUND_TASK_CANCEL_GRACE)
+        } else {
+            self.config.replicator_timeout
+        };
+        match tokio::time::timeout(budget, release.release()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!("Coordinator: failed to release lease for '{}': {}", name, e)
             }
-            Ok(Some((data, _))) => {
-                tracing::info!(
-                    "Coordinator: lease for '{}' held by {} (not us), skipping release",
-                    name,
-                    data.instance_id
-                );
-            }
-            Ok(None) => {}
-            Err(e) => {
-                tracing::error!(
-                    "Coordinator: failed to read lease for '{}' during release: {}",
-                    name,
-                    e
-                );
-            }
+            Err(_) => tracing::error!("Coordinator: lease release timed out for '{}'", name),
         }
     }
 
@@ -548,7 +553,8 @@ impl Coordinator {
                 role: shared_role,
                 leader_address: leader_addr,
                 cancel_tx,
-                task_handle,
+                task_handle: Some(task_handle),
+                release: None,
             },
         );
 
@@ -588,66 +594,44 @@ impl Coordinator {
         shared_position: Arc<AtomicU64>,
         shared_caught_up: Arc<AtomicBool>,
     ) {
-        // Spawn follower pull loop
-        let follower_handle = {
-            let behavior = self.follower_behavior.clone();
-            let replicator = self.replicator.clone();
-            let prefix = self.prefix.clone();
-            let db_name_clone = db_name.clone();
-            let db_path_clone = db_path.clone();
-            let pull_interval = self.config.follower_pull_interval;
-            let metrics = self.metrics.clone();
-            let position = shared_position.clone();
-            let caught_up = shared_caught_up.clone();
-
-            tokio::spawn(async move {
-                let _ = behavior
-                    .run_follower_loop(
-                        replicator,
-                        &prefix,
-                        &db_name_clone,
-                        &db_path_clone,
-                        pull_interval,
-                        position,
-                        caught_up,
-                        follower_stop_rx,
-                        metrics,
-                    )
-                    .await;
-            })
+        let ctx = LeaseMonitorContext {
+            lease,
+            replicator: self.replicator.clone(),
+            manifest_store: self.manifest_store.clone(),
+            manifest_poll_interval: self.config.manifest_poll_interval,
+            follower_behavior: self.follower_behavior.clone(),
+            prefix: self.prefix.clone(),
+            db_name: db_name.clone(),
+            db_path: db_path.clone(),
+            follower_stop_tx,
+            role_tx: self.role_tx.clone(),
+            config: lease_config.clone(),
+            replicator_timeout: self.config.replicator_timeout,
+            leader_address: leader_addr,
+            role_ref: shared_role,
+            self_address: lease_config.address.clone(),
+            follower_position: shared_position.clone(),
+            follower_caught_up: shared_caught_up.clone(),
+            cancel_rx,
+            node_registry: self.node_registry.clone(),
+            metrics: self.metrics.clone(),
         };
-
-        // Spawn lease monitor (generic — calls follower_behavior.catchup_on_promotion for DB-specific part)
-        let monitor_handle = {
-            let ctx = LeaseMonitorContext {
-                lease,
-                replicator: self.replicator.clone(),
-                manifest_store: self.manifest_store.clone(),
-                manifest_poll_interval: self.config.manifest_poll_interval,
-                follower_behavior: self.follower_behavior.clone(),
-                prefix: self.prefix.clone(),
-                db_name,
-                db_path,
-                follower_stop_tx,
-                role_tx: self.role_tx.clone(),
-                config: lease_config.clone(),
-                replicator_timeout: self.config.replicator_timeout,
-                leader_address: leader_addr,
-                role_ref: shared_role.clone(),
-                self_address: lease_config.address.clone(),
-                follower_position: shared_position.clone(),
-                follower_caught_up: shared_caught_up.clone(),
-                cancel_rx,
-                node_registry: self.node_registry.clone(),
-                metrics: self.metrics.clone(),
-            };
-
-            tokio::spawn(async move {
-                let _ = run_lease_monitor(ctx).await;
-            })
-        };
-
-        let _ = tokio::join!(follower_handle, monitor_handle);
+        // Both futures belong to this task. Aborting it must drop the lease
+        // owner too, not detach a monitor that can keep renewing after leave.
+        let _ = tokio::join!(
+            self.follower_behavior.run_follower_loop(
+                self.replicator.clone(),
+                &self.prefix,
+                &db_name,
+                &db_path,
+                self.config.follower_pull_interval,
+                shared_position,
+                shared_caught_up,
+                follower_stop_rx,
+                self.metrics.clone(),
+            ),
+            run_lease_monitor(ctx),
+        );
     }
 
     /// Simulate process-level crash for tests: abort all background tasks
@@ -675,7 +659,10 @@ impl Coordinator {
         let entries: Vec<(String, DbEntry)> = dbs.drain().collect();
         drop(dbs);
         for (name, entry) in entries {
-            entry.task_handle.abort();
+            if let Some(task) = entry.task_handle {
+                task.abort();
+                let _ = task.await;
+            }
             tracing::warn!(
                 "Coordinator: ABORTED tasks for '{}' (test-only crash simulation)",
                 name
@@ -684,93 +671,48 @@ impl Coordinator {
     }
 
     /// Leave the HA cluster for a database.
+    ///
+    /// Keep renewal alive through the final owned flush. Failed removal leaves
+    /// the entry and owner intact so the caller can retry without losing data.
     pub async fn leave(&self, name: &str) -> Result<()> {
-        let entry = self.databases.write().await.remove(name);
-        let entry = match entry {
-            Some(e) => e,
-            None => return Ok(()),
+        let mut entries = self.databases.write().await;
+        let Some(entry) = entries.get_mut(name) else {
+            return Ok(());
         };
-
-        let _ = entry.cancel_tx.send(true);
         let role = entry.role.load();
-        self.await_cancelled_task(name, entry.task_handle).await;
-
-        match role {
-            Role::Leader => {
-                if tokio::time::timeout(
-                    self.config.replicator_timeout,
-                    self.replicator.remove(name),
-                )
+        if role == Role::Leader {
+            tokio::time::timeout(self.config.replicator_timeout, self.replicator.remove(name))
                 .await
-                .is_err()
-                {
-                    tracing::error!(
-                        "Coordinator: replicator.remove('{}') timed out after {:?}, continuing leave",
-                        name,
-                        self.config.replicator_timeout
-                    );
-                }
-
-                if let Some(lease_config) = &self.config.lease {
-                    let lease_key = lease_config.store.key_for(name);
-                    let lease = DbLease::new(
-                        lease_config.store.clone(),
-                        &lease_key,
-                        &lease_config.instance_id,
-                        &lease_config.address,
-                        lease_config.ttl_secs,
-                    );
-                    match lease.read().await {
-                        Ok(Some((data, _))) if data.instance_id == lease_config.instance_id => {
-                            if let Err(e) = lease_config.store.delete(lease.lease_key()).await {
-                                tracing::error!(
-                                    "Coordinator: failed to release lease for '{}': {}",
-                                    name,
-                                    e
-                                );
-                            }
-                        }
-                        Ok(Some((data, _))) => {
-                            tracing::info!(
-                                "Coordinator: lease for '{}' held by {} (not us), skipping release",
-                                name,
-                                data.instance_id
-                            );
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::error!(
-                                "Coordinator: failed to read lease for '{}' during leave: {}",
-                                name,
-                                e
-                            );
-                        }
-                    }
-                }
-                tracing::info!("Coordinator: '{}' left (was Leader)", name);
-            }
-            Role::Follower => {
-                if let (Some(ref registry), Some(ref lease_config)) =
-                    (&self.node_registry, &self.config.lease)
-                {
-                    if let Err(e) = registry
-                        .deregister(&self.prefix, name, &lease_config.instance_id)
-                        .await
-                    {
-                        tracing::error!(
-                            "Coordinator: failed to deregister follower '{}': {}",
-                            name,
-                            e
-                        );
-                    }
-                }
-                tracing::info!("Coordinator: '{}' left (was Follower)", name);
-            }
-            Role::Client | Role::LatentWriter => {
-                tracing::info!("Coordinator: '{}' left (was {})", name, role);
-            }
+                .map_err(|_| {
+                    anyhow::anyhow!("Coordinator: final remove timed out for '{}'", name)
+                })??;
         }
 
+        let _ = entry.cancel_tx.send(true);
+        let owner_aborted = self
+            .await_cancelled_task(name, &mut entry.task_handle)
+            .await;
+        // Readiness role can still be Follower during promotion catch-up.
+        // Release any acquisition this actual task confirmed, regardless of role.
+        self.release_owned(name, entry.release.as_ref(), owner_aborted)
+            .await;
+        if role == Role::Follower {
+            if let (Some(registry), Some(lease_config)) = (&self.node_registry, &self.config.lease)
+            {
+                if let Err(e) = registry
+                    .deregister(&self.prefix, name, &lease_config.instance_id)
+                    .await
+                {
+                    tracing::error!(
+                        "Coordinator: failed to deregister follower '{}': {}",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
+        entries.remove(name);
+        tracing::info!("Coordinator: '{}' left (was {})", name, role);
         Ok(())
     }
 
@@ -891,8 +833,8 @@ impl Coordinator {
 
     /// Graceful leader handoff — release leadership without leaving the cluster.
     pub async fn handoff(&self, name: &str) -> Result<bool> {
-        let entry = self.databases.read().await;
-        let entry = match entry.get(name) {
+        let mut entries = self.databases.write().await;
+        let entry = match entries.get_mut(name) {
             Some(e) => e,
             None => return Ok(false),
         };
@@ -901,53 +843,24 @@ impl Coordinator {
             return Ok(false);
         }
 
-        let _ = entry.cancel_tx.send(true);
-
+        // Keep renewal alive while flushing. Stopping the owner clears its
+        // fence, so stop it only after the final owned writes have finished.
         // Flush pending data before releasing leadership.
-        if let Err(e) =
-            tokio::time::timeout(self.config.replicator_timeout, self.replicator.sync(name)).await
-        {
-            tracing::error!(
-                "Coordinator: handoff replicator.sync('{}') timed out after {:?}: {}",
-                name,
-                self.config.replicator_timeout,
-                e
-            );
-        }
-
-        if tokio::time::timeout(self.config.replicator_timeout, self.replicator.remove(name))
+        tokio::time::timeout(self.config.replicator_timeout, self.replicator.sync(name))
             .await
-            .is_err()
-        {
-            tracing::error!(
-                "Coordinator: handoff replicator.remove('{}') timed out after {:?}",
-                name,
-                self.config.replicator_timeout
-            );
-        }
+            .map_err(|_| anyhow::anyhow!("Coordinator: handoff sync timed out for '{}'", name))??;
+        tokio::time::timeout(self.config.replicator_timeout, self.replicator.remove(name))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("Coordinator: handoff remove timed out for '{}'", name)
+            })??;
 
-        if let Some(lease_config) = &self.config.lease {
-            let lease_key = lease_config.store.key_for(name);
-            let lease = DbLease::new(
-                lease_config.store.clone(),
-                &lease_key,
-                &lease_config.instance_id,
-                &lease_config.address,
-                lease_config.ttl_secs,
-            );
-            match lease.read().await {
-                Ok(Some((data, _))) if data.instance_id == lease_config.instance_id => {
-                    if let Err(e) = lease_config.store.delete(lease.lease_key()).await {
-                        tracing::error!(
-                            "Coordinator: failed to release lease during handoff for '{}': {}",
-                            name,
-                            e
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
+        let _ = entry.cancel_tx.send(true);
+        let owner_aborted = self
+            .await_cancelled_task(name, &mut entry.task_handle)
+            .await;
+        self.release_owned(name, entry.release.as_ref(), owner_aborted)
+            .await;
 
         entry.role.store(Role::Follower);
         let _ = self.role_tx.send(RoleEvent::Demoted {
